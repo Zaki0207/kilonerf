@@ -10,7 +10,10 @@ import run_nerf_helpers
 import torch
 from tqdm import tqdm
 import lpips
+# from kornia import create_meshgrid
 
+# BOX_OFFSETS = torch.tensor([[[i,j,k] for i in [0, 1] for j in [0, 1] for k in [0, 1]]],
+#                                device='cuda')
 
 def get_random_points_inside_domain(num_points, domain_min, domain_max):
     x = np.random.uniform(domain_min[0], domain_max[0], size=(num_points,))
@@ -25,6 +28,7 @@ def get_random_directions(num_samples):
 
 def load_pretrained_nerf_model(dev, cfg):
     pretrained_cfg = load_yaml_as_dict(cfg['pretrained_cfg_path'])
+    pretrained_cfg['bounding_box'] = cfg['bounding_box']
     if 'use_initialization_fix' not in pretrained_cfg:
         pretrained_cfg['use_initialization_fix'] = False
     if 'num_importance_samples_per_ray' not in pretrained_cfg:
@@ -33,24 +37,61 @@ def load_pretrained_nerf_model(dev, cfg):
     pretrained_nerf = pretrained_nerf.to(dev)
     checkpoint = torch.load(cfg['pretrained_checkpoint_path'])
     pretrained_nerf.load_state_dict(checkpoint['model_state_dict'])
+    if pretrained_cfg['turn_on_hash_feature']:
+        embed_fn.load_state_dict(checkpoint['embed_fn_state_dict'])
+        embed_fn = embed_fn.cuda()
     pretrained_nerf = run_nerf_helpers.ChainEmbeddingAndModel(pretrained_nerf, embed_fn, embeddirs_fn) # pos. encoding
     return pretrained_nerf
 
 def create_nerf(cfg):
-    embed_fn, input_ch = run_nerf_helpers.get_embedder(cfg['num_frequencies'], 0)
-    embeddirs_fn, input_ch_views = run_nerf_helpers.get_embedder(cfg['num_frequencies_direction'], 0)
-    output_ch = 4
+    
+    i_embed = 0 # 使用傅立叶变换特征：1
+    if cfg['turn_on_hash_feature']: # 使用哈希编码：0
+        i_embed = 1
+        
+    embed_fn, input_ch = run_nerf_helpers.get_embedder(cfg['num_frequencies'], cfg, i_embed)
+    
+    if i_embed==1:
+        # hashed embedding table
+        embedding_params = list(embed_fn.parameters())
+        
+    input_ch_views = 0
+    embeddirs_fn = None
+    
+    if cfg['use_viewdirs']:
+        embeddirs_fn, input_ch_views = run_nerf_helpers.get_embedder(cfg['num_frequencies_direction'], cfg, 2)
+    else:
+        embeddirs_fn, input_ch_views = run_nerf_helpers.get_embedder(cfg['num_frequencies_direction'], cfg, 0)
+    output_ch = 5 if cfg['num_importance_samples_per_ray'] > 0 else 4
     skips = [cfg['refeed_position_index']]
-    model = run_nerf_helpers.NeRF(D=cfg['num_hidden_layers'], W=cfg['hidden_layer_size'],
-                 input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch_views=input_ch_views, use_viewdirs=True,
-                 direction_layer_size=cfg['direction_layer_size'], use_initialization_fix=cfg['use_initialization_fix'])
+    
+    if i_embed==1:
+        model = run_nerf_helpers.NeRFSmall(num_layers=cfg['hash_mode_num_layers'],
+                        hidden_dim=cfg['hash_mode_hidden_dim'],
+                        geo_feat_dim=cfg['hash_mode_geo_feat_dim'],
+                        num_layers_color=cfg['hash_mode_num_layers_color'],
+                        hidden_dim_color=cfg['hash_mode_hidden_dim_color'],
+                        input_ch=input_ch, input_ch_views=input_ch_views)
+    else:
+        model = run_nerf_helpers.NeRF(D=cfg['num_hidden_layers'], W=cfg['hidden_layer_size'],
+                    input_ch=input_ch, output_ch=output_ch, skips=skips,
+                    input_ch_views=input_ch_views, use_viewdirs=True,
+                    direction_layer_size=cfg['direction_layer_size'], use_initialization_fix=cfg['use_initialization_fix'])
     
     if cfg['num_importance_samples_per_ray'] > 0:
-        model_fine = run_nerf_helpers.NeRF(D=cfg['num_hidden_layers'], W=cfg['hidden_layer_size'],
-                          input_ch=input_ch, output_ch=output_ch, skips=skips,
-                          input_ch_views=input_ch_views, use_viewdirs=True,
-                          direction_layer_size=cfg['direction_layer_size'], use_initialization_fix=cfg['use_initialization_fix'])
+        if i_embed==1:
+            model_fine = run_nerf_helpers.NeRFSmall(num_layers=cfg['hash_mode_num_layers'],
+                                            hidden_dim=cfg['hash_mode_hidden_dim'],
+                                            geo_feat_dim=cfg['hash_mode_geo_feat_dim'],
+                                            num_layers_color=cfg['hash_mode_num_layers_color'],
+                                            hidden_dim_color=cfg['hash_mode_hidden_dim_color'],
+                                            input_ch=input_ch, input_ch_views=input_ch_views)
+        
+        else:
+            model_fine = run_nerf_helpers.NeRF(D=cfg['num_hidden_layers'], W=cfg['hidden_layer_size'],
+                            input_ch=input_ch, output_ch=output_ch, skips=skips,
+                            input_ch_views=input_ch_views, use_viewdirs=True,
+                            direction_layer_size=cfg['direction_layer_size'], use_initialization_fix=cfg['use_initialization_fix'])
         model = run_nerf_helpers.CoarseAndFine(model, model_fine)
     
     return model, embed_fn, embeddirs_fn    
@@ -87,16 +128,20 @@ def parse_args_and_init_logger(default_cfg_path=None, parse_render_cfg_path=Fals
     if parse_render_cfg_path:
         parser.add_argument('-rcfg', '--render_cfg_path', type=str)
     args = parser.parse_args()
+    cfg = load_yaml_as_dict(args.cfg_path)
     if args.log_path is None:
         start = args.cfg_path.find('/')
         end = args.cfg_path.rfind('.')
         args.log_path = 'logs' + args.cfg_path[start:end]
+        if cfg['turn_on_hash_feature']:
+            args.log_path += '_hash'
+            args.log_path += str(cfg['n_hash_feature'])
         print('auto log path:', args.log_path)
     
     create_directory_if_not_exists(args.log_path)
     Logger.filename = args.log_path + '/log.txt'
     
-    cfg = load_yaml_as_dict(args.cfg_path)
+    # cfg = load_yaml_as_dict(args.cfg_path)
     if default_cfg_path is not None:
         default_cfg = load_yaml_as_dict(default_cfg_path)
         for key in default_cfg:
@@ -240,6 +285,34 @@ def get_distance_to_closest_point_in_box(point, domain_min, domain_max):
             closest_point[dim] = point[dim]
     return np.linalg.norm(point - closest_point)
     
+    
+def get_ray_directions(H, W, focal):
+    """
+    Get ray directions for all pixels in camera coordinate.
+    Reference: https://www.scratchapixel.com/lessons/3d-basic-rendering/
+               ray-tracing-generating-camera-rays/standard-coordinate-systems
+
+    Inputs:
+        H, W, focal: image height, width and focal length
+
+    Outputs:
+        directions: (H, W, 3), the direction of the rays in camera coordinate
+    """
+    
+    
+    grid = create_meshgrid(H, W, normalized_coordinates=False)[0]
+    i, j = grid.unbind(-1)
+    # the direction here is without +0.5 pixel centering as calibration is not so accurate
+    # see https://github.com/bmild/nerf/issues/24
+    directions = \
+        torch.stack([(i-W/2)/focal, -(j-H/2)/focal, -torch.ones_like(i)], -1) # (H, W, 3)
+
+    dir_bounds = directions.view(-1, 3)
+    # print("Directions ", directions[0,0,:], directions[H-1,0,:], directions[0,W-1,:], directions[H-1, W-1, :])
+    # print("Directions ", dir_bounds[0], dir_bounds[W-1], dir_bounds[H*W-W], dir_bounds[H*W-1])
+
+    return directions    
+    
 def get_distance_to_furthest_point_in_box(point, domain_min, domain_max):
     furthest_point = np.array([0., 0., 0.])
     for dim in range(3):
@@ -274,7 +347,107 @@ class ConfigManager:
         if device:
             result = [torch.tensor(x, dtype=torch.float, device=device) for x in result]
         return result
-           
+
+def get_rays(directions, c2w):
+    """
+    Get ray origin and normalized directions in world coordinate for all pixels in one image.
+    Reference: https://www.scratchapixel.com/lessons/3d-basic-rendering/
+               ray-tracing-generating-camera-rays/standard-coordinate-systems
+
+    Inputs:
+        directions: (H, W, 3) precomputed ray directions in camera coordinate
+        c2w: (3, 4) transformation matrix from camera coordinate to world coordinate
+
+    Outputs:
+        rays_o: (H*W, 3), the origin of the rays in world coordinate
+        rays_d: (H*W, 3), the normalized direction of the rays in world coordinate
+    """
+    # Rotate ray directions from camera coordinate to the world coordinate
+    rays_d = directions @ c2w[:3, :3].T # (H, W, 3)
+    rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+    # The origin of all rays is the camera origin in world coordinate
+    rays_o = c2w[:3, -1].expand(rays_d.shape) # (H, W, 3)
+
+    rays_d = rays_d.view(-1, 3)
+    rays_o = rays_o.view(-1, 3)
+
+    return rays_o, rays_d
+
+def get_bbox3d_for_blenderobj(poses, intrinsics, near=2.0, far=6.0):
+    
+    focal = intrinsics.fx
+    H = intrinsics.H
+    W = intrinsics.W
+    
+    # ray directions in camera coordinates
+    directions = get_ray_directions(H, W, focal)
+
+    min_bound = [100, 100, 100]
+    max_bound = [-100, -100, -100]
+
+    points = []
+
+    for pose in poses:
+        c2w = torch.FloatTensor(pose)
+        rays_o, rays_d = get_rays(directions, c2w)
+        
+        def find_min_max(pt):
+            for i in range(3):
+                if(min_bound[i] > pt[i]):
+                    min_bound[i] = pt[i]
+                if(max_bound[i] < pt[i]):
+                    max_bound[i] = pt[i]
+            return
+
+        for i in [0, W-1, H*W-W, H*W-1]:
+            min_point = rays_o[i] + near*rays_d[i]
+            max_point = rays_o[i] + far*rays_d[i]
+            points += [min_point, max_point]
+            find_min_max(min_point)
+            find_min_max(max_point)
+
+    return (torch.tensor(min_bound)-torch.tensor([1.0,1.0,1.0]), torch.tensor(max_bound)+torch.tensor([1.0,1.0,1.0]))
+
+def hash(coords, log2_hashmap_size):
+    '''
+    coords: this function can process upto 7 dim coordinates
+    log2T:  logarithm of T w.r.t 2
+    '''
+    primes = [1, 2654435761, 805459861, 3674653429, 2097192037, 1434869437, 2165219737]
+
+    xor_result = torch.zeros_like(coords)[..., 0]
+    for i in range(coords.shape[-1]):
+        xor_result ^= coords[..., i]*primes[i]
+
+    return torch.tensor((1<<log2_hashmap_size)-1).to(xor_result.device) & xor_result
+
+# def get_voxel_vertices(xyz, bounding_box, resolution, log2_hashmap_size):
+#     '''
+#     xyz: 3D coordinates of samples. B x 3
+#     bounding_box: min and max x,y,z coordinates of object bbox
+#     resolution: number of voxels per axis
+#     '''
+#     box_min, box_max = bounding_box
+
+#     keep_mask = xyz==torch.max(torch.min(xyz, box_max), box_min)
+#     if not torch.all(xyz <= box_max) or not torch.all(xyz >= box_min):
+#         # print("ALERT: some points are outside bounding box. Clipping them!")
+#         # xyz = torch.clamp(xyz, min=box_min, max=box_max)
+        
+#         xyz = torch.stack([torch.clamp(xyz[:,0],min=box_min[0],max=box_max[0]),torch.clamp(xyz[:,1],min=box_min[1],max=box_max[1]),
+#                    torch.clamp(xyz[:,2],min=box_min[2],max=box_max[2])],dim=1)
+
+#     grid_size = (box_max-box_min)/resolution
+    
+#     bottom_left_idx = torch.floor((xyz-box_min)/grid_size).int()
+#     voxel_min_vertex = bottom_left_idx*grid_size + box_min
+#     voxel_max_vertex = voxel_min_vertex + torch.tensor([1.0,1.0,1.0])*grid_size
+
+#     voxel_indices = bottom_left_idx.unsqueeze(1) + BOX_OFFSETS
+#     hashed_voxel_indices = hash(voxel_indices, log2_hashmap_size)
+
+#     return voxel_min_vertex, voxel_max_vertex, hashed_voxel_indices, keep_mask
+
         
 def main():
     if False:

@@ -36,7 +36,7 @@ fixed_resolution:
 max_error: 100000
 performance_monitoring: false
 pretrained_cfg_path: cfgs/paper/pretrain/Synthetic_NeRF_Chair.yaml
-pretrained_checkpoint_path: logs/paper/pretrain/Synthetic_NeRF_Chair/checkpoint_0600000.pth
+pretrained_checkpoint_path: logs/paper/pretrain/Synthetic_NeRF_Chair/checkpoint_0170000.pth
 render_only: true
 restart_after_checkpoint: true
 skip_final: true

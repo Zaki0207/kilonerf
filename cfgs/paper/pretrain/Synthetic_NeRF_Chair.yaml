@@ -21,3 +21,16 @@ raw_noise_std: 0.0
 refeed_position_index: 4
 render_testset_interval: 50000
 rng_seed: 5108603
+turn_on_hash_feature: true
+n_hash_feature: 8
+log2_hashmap_size: 19
+finest_res: 512
+use_viewdirs: true
+num_importance_samples_per_ray: 64
+hash_mode_num_layers: 2
+hash_mode_hidden_dim: 64
+hash_mode_geo_feat_dim: 15
+hash_mode_num_layers_color: 3
+hash_mode_hidden_dim_color: 64
+num_iters_to_del_feature: 1000
+threshold_of_psnr_to_del_feature: 28

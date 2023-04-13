@@ -5,7 +5,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
-import math
 import os
 import scipy.integrate as integrate
 import math
@@ -15,9 +14,12 @@ from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.pyplot as plt
 import itertools
 import time
+import run_nerf_helpers
 
 from utils import *
-from multi_modules import MultiNetwork, MultiNetworkFourierEmbedding, MultiNetworkLinear
+from multi_modules import MultiNetwork, MultiNetworkFourierEmbedding, MultiNetworkLinear, MultiNetworkHashEmbedding
+
+torch.cuda.set_device(1)
 
 # TODO: move this to utils.py
 class Node:
@@ -31,6 +33,16 @@ def create_multi_network_fourier_embedding(num_networks, num_frequencies):
         fourier_embedding = MultiNetworkFourierEmbedding(num_networks, 3, num_frequencies)
         num_input_channels = fourier_embedding.num_output_channels
     return num_input_channels, fourier_embedding
+
+def create_multi_network_hash_embedding(num_networks, cfg, i_embed):
+    
+    embed_fn, input_ch = run_nerf_helpers.get_embedder(0, cfg, i_embed)
+    
+    embed_fn = MultiNetworkHashEmbedding(num_networks,bounding_box=cfg['bounding_box'], \
+                            log2_hashmap_size=cfg['log2_hashmap_size'], \
+                            finest_resolution=cfg['finest_res'])
+    
+    return input_ch, embed_fn
 
 def create_multi_network(num_networks, num_position_channels, num_direction_channels, num_output_channels, linear_implementation, cfg):
     refeed_position_index = None
@@ -161,7 +173,7 @@ def train_and_test_multi_network(multi_network, all_examples, domain_mins, domai
         raw_output = multi_network(train_batch_inputs)
         out = postprocess_output(raw_output, cfg)
         loss = nn.functional.mse_loss(out, train_batch_targets, reduction='none')
-        loss = loss.mean(dim=2).mean(dim=1).sum()
+        loss = loss.mean(dim=2).mean(dim=1).sum() # mse=rgb+sigma
         loss.backward()
         optimizer.step()
         if iteration % 100 == 0:
@@ -292,11 +304,15 @@ def train_and_test_nodes(node_batch, pretrained_nerf, processing_saturated_nodes
     num_networks = len(node_batch)
     Logger.write('training {} networks in parallel'.format(num_networks))
     position_num_input_channels, position_fourier_embedding = create_multi_network_fourier_embedding(num_networks, cfg['num_frequencies'])
+    if 'hash_feature' in cfg:
+        position_num_input_channels, position_fourier_embedding = create_multi_network_hash_embedding(num_networks, cfg, i_embed=1)
     if cfg['outputs'] == 'density': 
         direction_num_input_channels, direction_fourier_embedding = 0, None
         num_output_channels = 1
     if cfg['outputs'] == 'color_and_density':
         direction_num_input_channels, direction_fourier_embedding = create_multi_network_fourier_embedding(num_networks, cfg['num_frequencies_direction'])
+        if 'hash_feature' in cfg:
+            direction_num_input_channels, direction_fourier_embedding = create_multi_network_hash_embedding(num_networks, cfg, i_embed=2)
         num_output_channels = 4
     MultiNetworkLinear.rng_state = None
     multi_network =  create_multi_network(num_networks, position_num_input_channels, direction_num_input_channels, 4, 'bmm', cfg).to(dev)
@@ -319,7 +335,7 @@ def train_and_test_nodes(node_batch, pretrained_nerf, processing_saturated_nodes
             all_examples[start:end, 0:3] = torch.tensor(get_random_points_inside_domain(cfg['num_examples_per_network'], node_batch[network_index].domain_min, node_batch[network_index].domain_max), dtype=torch.float)
         all_examples[start:end, 3:6] = torch.tensor(get_random_directions(cfg['num_examples_per_network']), dtype=torch.float)
     points_and_dirs = all_examples[:, 0:6]
-    num_points_and_dirs = len(points_and_dirs)
+    num_points_and_dirs = len(points_and_dirs) # ~500,000,000
     if 'query_batch_size' in cfg:
         query_batch_size = cfg['query_batch_size']
     else:
@@ -431,6 +447,7 @@ def train(cfg, log_path):
     
     ConfigManager.init(cfg)
     global_domain_min, global_domain_max = ConfigManager.get_global_domain_min_and_max()
+    cfg['bounding_box'] = (torch.tensor(global_domain_min), torch.tensor(global_domain_max))
     Logger.write('global_domain_min: {}, global_domain_max: {}'.format(global_domain_min, global_domain_max))
 
     # Load pretrained NeRF model:
@@ -519,16 +536,18 @@ def train(cfg, log_path):
                     node_batch[network_index].split_axis = split_axis
                     
                     if cfg['tree_type'] == 'kdtree_equal_error_split':
-            	        node_batch[network_index].split_threshold = get_equal_error_split_threshold(
+                        node_batch[network_index].split_threshold = get_equal_error_split_threshold(
             	            test_points[network_index],
             			    errors_per_point[cfg['discovery']['equal_split_metric']][network_index],
             			    node_batch[network_index].split_axis)
 
                     if cfg['tree_type'] == 'kdtree_random' or cfg['tree_type'] == 'kdtree_longest':
-                    	domain_min_coord = node_batch[network_index].domain_min[node_batch[network_index].split_axis]
-                    	domain_max_coord = node_batch[network_index].domain_max[node_batch[network_index].split_axis]
-                    	node_batch[network_index].split_threshold = domain_min_coord + (domain_max_coord - domain_min_coord) / 2
-                    
+                        domain_min_coord = node_batch[network_index].domain_min[node_batch[network_index].split_axis]
+                        domain_max_coord = node_batch[network_index].domain_max[node_batch[network_index].split_axis]
+                        node_batch[network_index].split_threshold = domain_min_coord + (domain_max_coord - domain_min_coord) / 2
+ 
+
+                                       
                     node_batch[network_index].leq_child = Node()
                     node_batch[network_index].gt_child = Node()
                     

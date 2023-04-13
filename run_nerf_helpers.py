@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 import kilonerf_cuda
 import math
+from hash_encoding import HashEmbedder, SHEncoder
 
 # Misc
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
@@ -46,22 +47,35 @@ class Embedder:
         return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
 
 
-def get_embedder(multires, i=0):
+def get_embedder(multires, args, i=0):
     if i == -1:
         return nn.Identity(), 3
     
-    embed_kwargs = {
-                'include_input' : True,
-                'input_dims' : 3,
-                'max_freq_log2' : multires-1,
-                'num_freqs' : multires,
-                'log_sampling' : True,
-                'periodic_fns' : [torch.sin, torch.cos],
-    }
+    elif i == 0:
+        embed_kwargs = {
+                    'include_input' : True,
+                    'input_dims' : 3,
+                    'max_freq_log2' : multires-1,
+                    'num_freqs' : multires,
+                    'log_sampling' : True,
+                    'periodic_fns' : [torch.sin, torch.cos],
+        }
     
-    embedder_obj = Embedder(**embed_kwargs)
-    embed = lambda x, eo=embedder_obj : eo.embed(x)
-    return embed, embedder_obj.out_dim
+        embedder_obj = Embedder(**embed_kwargs)
+        embed = lambda x, eo=embedder_obj : eo.embed(x)
+        out_dim = embedder_obj.out_dim
+    elif i==1:
+        embed = HashEmbedder(bounding_box=args['bounding_box'], \
+                            n_levels = args['n_levels'], \
+                            log2_hashmap_size=args['log2_hashmap_size'], \
+                            finest_resolution=args['finest_res'])
+        out_dim = embed.out_dim
+    elif i==2:
+        embed = SHEncoder()
+        out_dim = embed.out_dim       
+    
+    
+    return embed, out_dim
     
 
 class DenseLayer(nn.Linear):
@@ -292,11 +306,17 @@ class ChainEmbeddingAndModel(nn.Module):
         self.embeddirs_fn = embeddirs_fn
     
     def forward(self, points_and_dirs):
-        embedded_points = self.embed_fn(points_and_dirs[:, :3])
+        if isinstance(self.embed_fn, HashEmbedder):
+            embedded_points, keep_mask = self.embed_fn(points_and_dirs[:, :3])
+        else:
+            embedded_points = self.embed_fn(points_and_dirs[:, :3])
         if self.embeddirs_fn is not None:
             embedded_dirs = self.embeddirs_fn(points_and_dirs[:, 3:])
             embedded_points_and_dirs = torch.cat([embedded_points, embedded_dirs], -1)
-            return self.model(embedded_points_and_dirs)
+            if isinstance(self.embed_fn, HashEmbedder):
+                return self.model.model_fine(embedded_points_and_dirs)
+            else:
+                return self.model(embedded_points_and_dirs)
         else:
             return self.model(embedded_points)
 
@@ -351,3 +371,84 @@ class OrbitCamera:
         look_from = self.center + offset
         look_to = self.center
         self.c2w = torch.tensor(lookat(look_from, look_to), dtype=torch.float, device=self.device)
+        
+# Small NeRF for Hash embeddings
+class NeRFSmall(nn.Module):
+    def __init__(self,
+                 num_layers=3,
+                 hidden_dim=64,
+                 geo_feat_dim=15,
+                 num_layers_color=4,
+                 hidden_dim_color=64,
+                 input_ch=3, input_ch_views=3,
+                 ):
+        super(NeRFSmall, self).__init__()
+
+        self.input_ch = input_ch
+        self.input_ch_views = input_ch_views
+
+        # sigma network
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.geo_feat_dim = geo_feat_dim
+
+        sigma_net = []
+        for l in range(num_layers):
+            if l == 0:
+                in_dim = self.input_ch
+            else:
+                in_dim = hidden_dim
+            
+            if l == num_layers - 1:
+                out_dim = 1 + self.geo_feat_dim # 1 sigma + 15 SH features for color
+            else:
+                out_dim = hidden_dim
+            
+            sigma_net.append(nn.Linear(in_dim, out_dim, bias=False))
+
+        self.sigma_net = nn.ModuleList(sigma_net)
+
+        # color network
+        self.num_layers_color = num_layers_color        
+        self.hidden_dim_color = hidden_dim_color
+        
+        color_net =  []
+        for l in range(num_layers_color):
+            if l == 0:
+                in_dim = self.input_ch_views + self.geo_feat_dim
+            else:
+                in_dim = hidden_dim
+            
+            if l == num_layers_color - 1:
+                out_dim = 3 # 3 rgb
+            else:
+                out_dim = hidden_dim
+            
+            color_net.append(nn.Linear(in_dim, out_dim, bias=False))
+
+        self.color_net = nn.ModuleList(color_net)
+    
+    def forward(self, x):
+        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
+
+        # sigma
+        h = input_pts
+        for l in range(self.num_layers):
+            h = self.sigma_net[l](h)
+            if l != self.num_layers - 1:
+                h = F.relu(h, inplace=True)
+
+        sigma, geo_feat = h[..., 0], h[..., 1:]
+        
+        # color
+        h = torch.cat([input_views, geo_feat], dim=-1)
+        for l in range(self.num_layers_color):
+            h = self.color_net[l](h)
+            if l != self.num_layers_color - 1:
+                h = F.relu(h, inplace=True)
+            
+        # color = torch.sigmoid(h)
+        color = h
+        outputs = torch.cat([color, sigma.unsqueeze(dim=-1)], -1)
+
+        return outputs

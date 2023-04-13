@@ -20,6 +20,7 @@ from local_distill import create_multi_network_fourier_embedding, has_flag, crea
 from multi_modules import build_multi_network_from_single_networks, query_multi_network
 import kilonerf_cuda
 
+
 # TODO: move this to utils.py
 class Node:
     def __init__(self):
@@ -49,7 +50,7 @@ def build_occupancy_tree(cfg, log_path):
         # end2end from scratch case
         assert pretrained_cfg['model_type'] == 'multi_network', 'occupancy grid creation is only implemented for multi networks'
     """
-    
+    cfg['bounding_box'] = (torch.tensor(global_domain_min), torch.tensor(global_domain_max))
     cp = torch.load(cfg['pretrained_checkpoint_path'])
     use_multi_network = pretrained_cfg['model_type'] == 'multi_network' or not ('model_type' in pretrained_cfg)
     if use_multi_network:
@@ -106,7 +107,7 @@ def build_occupancy_tree(cfg, log_path):
     total_num_voxels = occupancy_res[0] * occupancy_res[1] * occupancy_res[2]
     occupancy_grid = torch.tensor(occupancy_res, device=dev, dtype=torch.bool)
     occupancy_resolution = torch.tensor(occupancy_res, dtype=torch.long, device=torch.device('cpu'))
-    occupancy_voxel_size = global_domain_size / occupancy_resolution
+    occupancy_voxel_size = global_domain_size / occupancy_resolution # (3)
     first_voxel_min = global_domain_min
     first_voxel_max = first_voxel_min + occupancy_voxel_size
     
@@ -119,15 +120,15 @@ def build_occupancy_tree(cfg, log_path):
     for dim in range(3):
         ranges.append(torch.arange(0, occupancy_res[dim]))
     index_grid = torch.stack(torch.meshgrid(*ranges), dim=3)
-    index_grid = (index_grid * occupancy_voxel_size).unsqueeze(3)
+    index_grid = (index_grid * occupancy_voxel_size).unsqueeze(3) # coord (x,y,z)
     
     points = first_voxel_samples.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(occupancy_res + list(first_voxel_samples.shape))
     points = points + index_grid
     points = points.view(total_num_voxels, -1, 3)
-    num_samples_per_voxel = points.size(1)
+    num_samples_per_voxel = points.size(1) # each voxel has 3*3*3 = 27 points
 
     
-    mock_directions = torch.empty(min(cfg['voxel_batch_size'], total_num_voxels), 3).to(dev)
+    mock_directions = torch.empty(min(cfg['voxel_batch_size'], total_num_voxels), 3).to(dev) # 未初始化 each voxel
 
     # We query in a fixed grid at a higher resolution than the occupancy grid resolution to detect fine structures.
     all_densities = torch.empty(total_num_voxels, num_samples_per_voxel)
@@ -155,8 +156,8 @@ def build_occupancy_tree(cfg, log_path):
     del all_densities
     occupancy_grid = occupancy_grid.view(cfg['resolution'] + [-1])
 
-    occupancy_grid = occupancy_grid.any(dim=3) # checks if any point in the voxel is above the threshold
-
+    occupancy_grid = occupancy_grid.any(dim=3) # checks if any point in the voxel is above the threshold 
+    # any points can determine the occupancy of this voxel
     
     Logger.write('{} out of {} voxels are occupied. {:.2f}%'.format(occupancy_grid.sum().item(), occupancy_grid.numel(), 100 * occupancy_grid.sum().item() / occupancy_grid.numel()))
     

@@ -9,7 +9,7 @@ discovery:
   direction_layer_size: 32
   equal_split_metric: mse
   hidden_layer_size: 32
-  iterations: 150000
+  iterations: 30000
   late_feed_direction: true
   max_num_networks: 512
   network_rng_seed: 8078673
@@ -36,8 +36,10 @@ fixed_resolution:
 max_error: 100000
 performance_monitoring: false
 pretrained_cfg_path: cfgs/paper/pretrain/Synthetic_NeRF_Lego.yaml
-pretrained_checkpoint_path: logs/paper/pretrain/Synthetic_NeRF_Lego/checkpoint_0600000.pth
+pretrained_checkpoint_path: logs/paper/pretrain/Synthetic_NeRF_Lego_hash8/checkpoint_0010000.pth
 render_only: true
 restart_after_checkpoint: true
 skip_final: true
 tree_type: kdtree_longest
+turn_on_hash_feature: true
+n_hash_feature: 8

@@ -7,6 +7,8 @@ import time
 import kilonerf_cuda
 from utils import *
 from torch.distributions.bernoulli import Bernoulli
+import hash_encoding
+
 
 # Only this function had to be changed to account for multi networks (weight tensors have aditionally a network dimension)
 def _calculate_fan_in_and_fan_out(tensor):
@@ -71,7 +73,74 @@ def xavier_normal_(tensor, gain=1.):
     std = gain * math.sqrt(2.0 / float(fan_in + fan_out))
     with torch.no_grad():
         return tensor.normal_(0., std)
+    
+class MultiNetworkHashEmbedding(nn.Module):
+    def __init__(self, num_networks, bounding_box, n_levels=16, n_features_per_level=2,\
+                log2_hashmap_size=19, base_resolution=16, finest_resolution=512):
+        super(MultiNetworkHashEmbedding, self).__init__()
+        self.num_networks = num_networks
+        self.bounding_box = bounding_box
+        self.n_levels = n_levels
+        self.n_features_per_level = n_features_per_level
+        self.log2_hashmap_size = log2_hashmap_size
+        self.base_resolution = torch.tensor(base_resolution)
+        self.finest_resolution = torch.tensor(finest_resolution)
+        self.out_dim = self.n_levels * self.n_features_per_level
+
+        self.b = torch.exp((torch.log(self.finest_resolution)-torch.log(self.base_resolution))/(n_levels-1))
+
+        self.embeddings = nn.ModuleList([nn.Embedding(2**self.log2_hashmap_size, \
+                                        self.n_features_per_level) for i in range(n_levels)])
+        # custom uniform initialization
+        for i in range(n_levels):
+            nn.init.uniform_(self.embeddings[i].weight, a=-0.0001, b=0.0001)
+            # self.embeddings[i].weight.data.zero_()
         
+
+    def trilinear_interp(self, x, voxel_min_vertex, voxel_max_vertex, voxel_embedds):
+        '''
+        x: B x 3
+        voxel_min_vertex: B x 3
+        voxel_max_vertex: B x 3
+        voxel_embedds: B x 8 x 2
+        '''
+        # source: https://en.wikipedia.org/wiki/Trilinear_interpolation
+        weights = (x - voxel_min_vertex)/(voxel_max_vertex-voxel_min_vertex) # B x 3
+
+        # step 1
+        # 0->000, 1->001, 2->010, 3->011, 4->100, 5->101, 6->110, 7->111
+        c00 = voxel_embedds[:,0]*(1-weights[:,0][:,None]) + voxel_embedds[:,4]*weights[:,0][:,None]
+        c01 = voxel_embedds[:,1]*(1-weights[:,0][:,None]) + voxel_embedds[:,5]*weights[:,0][:,None]
+        c10 = voxel_embedds[:,2]*(1-weights[:,0][:,None]) + voxel_embedds[:,6]*weights[:,0][:,None]
+        c11 = voxel_embedds[:,3]*(1-weights[:,0][:,None]) + voxel_embedds[:,7]*weights[:,0][:,None]
+
+        # step 2
+        c0 = c00*(1-weights[:,1][:,None]) + c10*weights[:,1][:,None]
+        c1 = c01*(1-weights[:,1][:,None]) + c11*weights[:,1][:,None]
+
+        # step 3
+        c = c0*(1-weights[:,2][:,None]) + c1*weights[:,2][:,None]
+
+        return c
+
+    def forward(self, x):
+        # x is 3D point position: num * B x 3
+        x_embedded_all = []
+        for i in range(self.n_levels):
+            resolution = torch.floor(self.base_resolution * self.b**i)
+            voxel_min_vertex, voxel_max_vertex, hashed_voxel_indices, keep_mask = get_voxel_vertices(\
+                                                x, self.bounding_box, \
+                                                resolution, self.log2_hashmap_size)
+            
+            voxel_embedds = self.embeddings[i](hashed_voxel_indices)
+
+            x_embedded = self.trilinear_interp(x, voxel_min_vertex, voxel_max_vertex, voxel_embedds)
+            x_embedded_all.append(x_embedded)
+
+        keep_mask = keep_mask.sum(dim=-1)==keep_mask.shape[-1]
+        return torch.cat(x_embedded_all, dim=-1), keep_mask
+        
+
 class MultiNetworkFourierEmbedding(nn.Module):
     def __init__(self, num_networks, num_input_channels, num_frequencies,):
         super(MultiNetworkFourierEmbedding, self).__init__()
@@ -626,6 +695,7 @@ def query_multi_network(multi_network, domain_mins, domain_maxs, points, directi
         del point_in_occupied_space
     proper_index = torch.logical_and(point_indices >= 0, point_indices < num_networks) # probably this is not needed if we check for points_flat <= global_domain_max
     active_samples_mask = torch.nonzero(torch.logical_and(active_samples_mask, proper_index), as_tuple=False).squeeze()
+    # active_samples_mask = torch.nonzero(active_samples_mask, as_tuple=False).squeeze()
     del proper_index
     
     filtered_point_indices = point_indices[active_samples_mask]

@@ -7,7 +7,9 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Categorical
 from torch.distributions.bernoulli import Bernoulli
+from radam import RAdam
 import warnings
 import itertools
 from tqdm import tqdm, trange
@@ -15,6 +17,8 @@ from copy import copy
 import math
 import pathlib
 from skimage.metrics import structural_similarity as calculate_ssim
+from loss import sigma_sparsity_loss, total_variation_loss
+# from tensorboardX import SummaryWriter
 
 import matplotlib.pyplot as plt
 
@@ -30,9 +34,10 @@ import yaml
 from fast_kilonerf_renderer import FastKiloNeRFRenderer
 from local_distill import create_multi_network_fourier_embedding, has_flag, create_multi_network
 from multi_modules import build_multi_network_from_single_networks, extract_linears, query_multi_network
-from utils import ConfigManager, PerfMonitor, parse_args_and_init_logger, Logger, create_nerf, get_random_directions, load_yaml_as_dict, LPIPS
+from utils import ConfigManager, PerfMonitor, parse_args_and_init_logger, Logger, create_nerf, get_random_directions, load_yaml_as_dict, LPIPS, get_bbox3d_for_blenderobj
 from von_mises import sample_von_mises_3d
 
+torch.cuda.set_device(0)
 device = torch.device("cuda")
 DEBUG = False
 RESTART_EXIT_CODE = 3
@@ -61,7 +66,11 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-    embedded = embed_fn(inputs_flat)
+    
+    if isinstance(embed_fn, HashEmbedder):
+        embedded, keep_mask = embed_fn(inputs_flat)
+    else:
+        embedded = embed_fn(inputs_flat)
 
     if viewdirs is not None:
         input_dirs = viewdirs[:,None].expand(inputs.shape)
@@ -70,6 +79,10 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
         embedded = torch.cat([embedded, embedded_dirs], -1)
 
     outputs_flat = batchify(fn, netchunk)(embedded)
+    
+    if isinstance(embed_fn, HashEmbedder):
+        outputs_flat[~keep_mask, -1] = 0 # set sigma to 0 for invalid points
+    
     outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
 
@@ -301,9 +314,9 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, backgrou
 
     # Initially the transmittance should equal 1 for all rays
     initial_transmittance = torch.ones((alpha.shape[0], 1))
-    transmittance = torch.cumprod(torch.cat([initial_transmittance, 1. - alpha + 1e-10], -1), -1)
+    transmittance_all = torch.cumprod(torch.cat([initial_transmittance, 1. - alpha + 1e-10], -1), -1)
     
-    transmittance = transmittance[:, :-1] # all columns but last column
+    transmittance = transmittance_all[:, :-1] # all columns but last column
     weights = alpha * transmittance
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
     acc_map = torch.sum(weights, -1)
@@ -311,10 +324,14 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, backgrou
     # Optionally add a white (default) or background of another custom solid color.
     if white_bkgd:
         rgb_map = rgb_map + replace_transparency_by_background_color(acc_map, background_color)
-  
+    
+    entropy = Categorical(probs = torch.cat([weights, 1.0-weights.sum(-1, keepdim=True)+1e-6], dim=-1)).entropy()
+    sparsity_loss = entropy
+    
     depth_map = torch.sum(weights * z_vals, -1)
-    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))    
-    return rgb_map, disp_map, acc_map, weights, depth_map, alpha, transmittance
+    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1)) 
+       
+    return rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss
 
 
 def render_rays(ray_batch,
@@ -396,11 +413,11 @@ def render_rays(ray_batch,
             raw[inside_global_domain] = torch.tensor([0., 0., 0., 10000], device=device)
     
     no_color_sigmoid = has_flag(cfg, 'no_color_sigmoid')
-    rgb_map, disp_map, acc_map, weights, depth_map, alpha, transmittance = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, background_color,
+    rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, background_color,
         pytest=pytest, no_color_sigmoid=no_color_sigmoid)
         
     if N_importance > 0:
-        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
+        rgb_map_0, disp_map_0, acc_map_0, sparsity_loss_0 = rgb_map, disp_map, acc_map, sparsity_loss
     
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
@@ -420,10 +437,10 @@ def render_rays(ray_batch,
             raw = raw_flat.view(raw.size())
             del pts_flat, raw_flat
 
-        rgb_map, disp_map, acc_map, weights, depth_map, alpha, transmittance = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, background_color, 
+        rgb_map, disp_map, acc_map, weights, depth_map, sparsity_loss = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, background_color, 
             pytest=pytest, no_color_sigmoid=no_color_sigmoid)
 
-    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
+    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'sparsity_loss': sparsity_loss}
     if visualize_hot_intervals:
         ret.update({'weights': weights, 'pts': pts})
     if retraw:
@@ -432,6 +449,7 @@ def render_rays(ray_batch,
         ret['rgb0'] = rgb_map_0
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
+        ret['sparsity_loss0'] = sparsity_loss_0
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
         
     for k in ret:
@@ -550,7 +568,7 @@ def train(cfg, log_path, render_cfg_path):
         test_traj_path = cfg['test_traj_path'] if 'test_traj_path' in cfg else None
         images, poses, intrinsics, near, far, background_color, render_poses, i_split = load_nsvf_dataset(cfg['dataset_dir'],  cfg['testskip'], test_traj_path)
         print('Loaded a NSVF-style dataset', images.shape, poses.shape, render_poses.shape, cfg['dataset_dir'])
-        
+        # cfg['bounding_box'] = get_bbox3d_for_blenderobj(poses, intrinsics, near, far)
         i_train, i_val, i_test = i_split
         if i_test.size == 0:
             i_test = i_val
@@ -597,6 +615,9 @@ def train(cfg, log_path, render_cfg_path):
         far = cfg['far']
     
     global_domain_min, global_domain_max = ConfigManager.get_global_domain_min_and_max()
+    # if cfg['turn_on_hash_feature']:
+        # global_domain_min, global_domain_max = cfg['bounding_box']
+    
     Logger.write('global_domain_min: {}, global_domain_max: {}, near: {}, far: {}, background_color: {}'.format(global_domain_min, global_domain_max, near, far, background_color))
     
     render_subset = 'custom_path'
@@ -646,8 +667,11 @@ def train(cfg, log_path, render_cfg_path):
         'cfg': cfg # TODO: hacky to pass down the whole config
     }
     
+    cfg['bounding_box'] = (torch.tensor(global_domain_min), torch.tensor(global_domain_max))
+    
     # Create model
     if cfg['model_type'] == 'single_network':
+        # if cfg['turn_on_hash_feature']:
         model, embed_fn, embeddirs_fn = create_nerf(cfg)
         model = model.to(device)
         network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
@@ -661,7 +685,7 @@ def train(cfg, log_path, render_cfg_path):
         }                                                            
         
     elif cfg['model_type'] == 'multi_network' or load_from_distilled:
-        # Required for fast training
+        print('multi-net model on!') 
         kilonerf_cuda.init_stream_pool(16)
         kilonerf_cuda.init_magma()
         
@@ -808,17 +832,25 @@ def train(cfg, log_path, render_cfg_path):
     # Create optimizer
     cfg['initial_learning_rate'] = float(cfg['initial_learning_rate'])
     
-    optimizer_type = cfg['optimizer_type'] if 'optimizer_type' in cfg else 'adam'
-    if optimizer_type == 'adam':
-        optimizer = torch.optim.Adam(params=model.parameters(), lr=cfg['initial_learning_rate'], betas=(0.9, 0.999))
-    elif optimizer_type == 'sgd':
-        optimizer = torch.optim.SGD(params=model.parameters(), lr=cfg['initial_learning_rate']) # no momentum
+    if cfg['turn_on_hash_feature']:
+        optimizer = RAdam([
+                    {'params': model.parameters(), 'weight_decay': 1e-6},
+                    {'params': embed_fn.parameters(), 'eps': 1e-15}], lr=cfg['initial_learning_rate'], betas=(0.9, 0.99))
+    
+    else:
+        optimizer_type = cfg['optimizer_type'] if 'optimizer_type' in cfg else 'adam'
+        if optimizer_type == 'adam':
+            optimizer = torch.optim.Adam(params=model.parameters(), lr=cfg['initial_learning_rate'], betas=(0.9, 0.999))
+        elif optimizer_type == 'sgd':
+            optimizer = torch.optim.SGD(params=model.parameters(), lr=cfg['initial_learning_rate']) # no momentum
 
     start = 0
     if load_from_checkpoint and not load_from_distilled:
         optimizer.load_state_dict(cp['optimizer_state_dict'])
         model.load_state_dict(cp['model_state_dict'])
         start = cp['global_step'] + 1
+        if cfg['turn_on_hash_feature']:
+            embed_fn.load_state_dict(cp['embed_fn_state_dict'])
     global_step = start
     
     use_fused_network_eval_kernel = 'render' in cfg and has_flag(cfg['render'], 'fast_sampling')
@@ -893,6 +925,9 @@ def train(cfg, log_path, render_cfg_path):
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
     print('VAL views are', i_val)
+    
+    # writer = SummaryWriter(os.path.join('summaries', cfg['dataset_dir']))
+    # writer = SummaryWriter(os.path.join('summaries', log_path[5:]))
 
     # Load rng_state from checkpoints to avoid repeating sampling pattern (could be a big problem when checkpointing frequently)
     if has_flag(cfg, 'rng_seed_fix') and load_from_checkpoint and 'torch_rng_state' in cp:
@@ -923,6 +958,7 @@ def train(cfg, log_path, render_cfg_path):
         else:
             # Random from one image
             img_i = np.random.choice(i_train)
+            # img_i = 10
             target = images[img_i]
             pose = poses[img_i, :3,:4]
 
@@ -990,6 +1026,9 @@ def train(cfg, log_path, render_cfg_path):
             loss = img_loss
             psnr = mse2psnr(img_loss)
             
+            # writer.add_scalar('train/MSE', loss, i)
+            # writer.add_scalar('train/PSNR', psnr, i)
+            
             if 'l2_regularization_lambda' in cfg:
                 l2_reg_term = multi_network.view_dependent_parameters[0].norm(2)
                 for param in multi_network.view_dependent_parameters[1:]:
@@ -1005,7 +1044,40 @@ def train(cfg, log_path, render_cfg_path):
                 img_loss0 = img2mse(extras['rgb0'], target_s)
                 loss = loss + img_loss0
                 psnr0 = mse2psnr(img_loss0)
+                
+            # 空间删除
+            if cfg['turn_on_hash_feature']:
+                TV_loss = 0
+                if i % cfg['num_iters_to_del_feature'] == 0 and psnr > cfg['threshold_of_psnr_to_del_feature']:
+                # if True: # for test
+                    tv_loss_weight = 1e-6
+                    n_levels = 16
+                    min_res = 16
+                    max_res = 512
+                    log2_hashmap_size = 19
+                    TV_loss = sum(total_variation_loss(embed_fn.embeddings[i], \
+                                    min_res, max_res, \
+                                    i, log2_hashmap_size, \
+                                    n_levels=n_levels) for i in range(n_levels))
+                sparsity_loss = cfg['sparsity_loss_weight']*(extras["sparsity_loss"].sum() + extras["sparsity_loss0"].sum())
+                loss = loss + sparsity_loss + TV_loss / i
+                # loss = loss + sparsity_loss
             
+            # add Total Variation loss
+            # if cfg['turn_on_hash_feature']:
+            #     tv_loss_weight = 1e-6
+            #     n_levels = 16
+            #     min_res = 16
+            #     max_res = 512
+            #     log2_hashmap_size = 19
+            #     TV_loss = sum(total_variation_loss(render_kwargs_train["embed_fn"].embeddings[i], \
+            #                                     min_res, max_res, \
+            #                                     i, log2_hashmap_size, \
+            #                                     n_levels=n_levels) for i in range(n_levels))
+            #     loss = loss + tv_loss_weight * TV_loss
+            #     if i>1000:
+            #         tv_loss_weight = 0.0
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -1050,19 +1122,31 @@ def train(cfg, log_path, render_cfg_path):
             tqdm.write(log_str)
 
         if i % cfg['checkpoint_interval'] == 0:
+        # if i % 100 == 0:
             torch_rng_state = torch.get_rng_state()
             torch_cuda_rng_state = torch.cuda.get_rng_state()
             numpy_rng_state = np.random.get_state()
             if has_flag(cfg, 'rng_seed_fix'):
                 Logger.write('Saving rng state. torch: {}, torch cuda: {}, numpy: {}'.format(torch_rng_state.sum(), torch_cuda_rng_state.sum(), numpy_rng_state[1].sum()))
-            cp = {
-                'global_step': global_step,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'torch_rng_state': torch_rng_state,
-                'torch_cuda_rng_state': torch_cuda_rng_state,
-                'numpy_rng_state': numpy_rng_state
-            }
+            if cfg['turn_on_hash_feature']:
+                cp = {
+                    'global_step': global_step,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'embed_fn_state_dict': embed_fn.state_dict(),
+                    'torch_rng_state': torch_rng_state,
+                    'torch_cuda_rng_state': torch_cuda_rng_state,
+                    'numpy_rng_state': numpy_rng_state
+                }
+            else:
+                cp = {
+                    'global_step': global_step,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'torch_rng_state': torch_rng_state,
+                    'torch_cuda_rng_state': torch_cuda_rng_state,
+                    'numpy_rng_state': numpy_rng_state
+                }
             checkpoint_path = log_path + '/checkpoint_{:07d}.pth'.format(i)
             torch.save(cp, checkpoint_path)
             Logger.write('Saved checkpoint at {}'.format(checkpoint_path))

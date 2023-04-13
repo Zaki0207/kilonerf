@@ -1,4 +1,4 @@
-name: kilonerf
+name: knfff
 channels:
   - pytorch
   - conda-forge
