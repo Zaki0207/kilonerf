@@ -33,4 +33,8 @@ hash_mode_hidden_dim: 64
 hash_mode_geo_feat_dim: 15
 hash_mode_num_layers_color: 3
 hash_mode_hidden_dim_color: 64
+n_levels: 16
+sparsity_loss_weight: 1e-10
+num_iters_to_del_feature: 1000
+threshold_of_psnr_to_del_feature: 25
 

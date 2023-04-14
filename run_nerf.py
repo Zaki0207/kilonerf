@@ -1059,7 +1059,7 @@ def train(cfg, log_path, render_cfg_path):
                                     min_res, max_res, \
                                     i, log2_hashmap_size, \
                                     n_levels=n_levels) for i in range(n_levels))
-                sparsity_loss = cfg['sparsity_loss_weight']*(extras["sparsity_loss"].sum() + extras["sparsity_loss0"].sum())
+                sparsity_loss = float(cfg['sparsity_loss_weight'])*(extras["sparsity_loss"].sum() + extras["sparsity_loss0"].sum())
                 loss = loss + sparsity_loss + TV_loss / i
                 # loss = loss + sparsity_loss
             
